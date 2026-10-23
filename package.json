@@ -1,0 +1,13 @@
+{
+  "name": "robos-atualizacao",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Robôs de atualização: logam no SSW, baixam cadastros/relatórios e alimentam as bases do PainelDG.",
+  "scripts": {
+    "motoristas": "node motoristas047.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "playwright": "^1.47.2"
+  }
+}
