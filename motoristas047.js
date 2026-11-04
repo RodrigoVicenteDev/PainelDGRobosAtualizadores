@@ -2,14 +2,19 @@
 //
 // Fluxo: login SSW -> opção 047 -> preenche
 //   Relação = T (todos), Bloqueado = T (todos),
-//   Último movimento (período) = (hoje - 1 ano) até hoje,  Arquivo em Excel = S
-//   -> clica ► (com Excel=S o SSW já baixa o CSV direto, sem passar pela fila 156)
-//   -> sobe o arquivo na API Dago (POST /api/motoristas-ssw/importar).
+//   Arquivo em Excel = S -> clica ► (com Excel=S o SSW já baixa o CSV direto, sem fila 156)
+//   Duas passadas (o SSW não tem "OU" entre os filtros):
+//     1) Último movimento = (hoje - 1 ano) até hoje  -> quem roda
+//     2) Período de cadastramento = (hoje - DIAS_CADASTRO) até hoje, movimento vazio
+//        -> recém-cadastrados que ainda não têm movimento (a 1ª passada não pega)
+//   -> junta os dois CSVs e sobe UMA vez na API Dago (POST /api/motoristas-ssw/importar).
+//   Se a 2ª passada falhar (ex.: ninguém cadastrado no período), segue só com a 1ª.
 //
 // Vars no .env (ver .env.example):
 //   SITE_DOMINIO, SITE_CPF, SITE_USER, SITE_PASS  (login SSW)
 //   DAGO_API_BASE, DAGO_EMAIL, DAGO_SENHA         (API Dago)
 //   HEADLESS=1 (0 p/ ver o navegador), SLOWMO, DEBUG=1 (prints em debug/)
+//   DIAS_CADASTRO=30 (janela da 2ª passada)
 const path = require("path");
 require("dotenv").config({ path: path.join(__dirname, ".env") });
 const fs = require("fs");
@@ -69,6 +74,9 @@ function partesBR(date) {
 function hojeBR() {
   return ddMMyy(partesBR(new Date()));
 }
+function diasAtrasBR(dias) {
+  return ddMMyy(partesBR(new Date(Date.now() - dias * 24 * 60 * 60 * 1000)));
+}
 function umAnoAtrasBR() {
   const d = new Date();
   d.setFullYear(d.getFullYear() - 1);
@@ -77,6 +85,8 @@ function umAnoAtrasBR() {
 
 // ================= HELPERS SSW (frames imprevisíveis) =================
 const LOGIN_URL = "https://sistema.ssw.inf.br/bin/ssw0422";
+const MENU_URL = "https://sistema.ssw.inf.br/bin/menu01";
+const DIAS_CADASTRO = Number(process.env.DIAS_CADASTRO || 30);
 
 async function scopeWithSelector(page, selector, timeoutMs = 30000) {
   const deadline = Date.now() + timeoutMs;
@@ -179,7 +189,8 @@ async function runOnce() {
   const HEADLESS = String(process.env.HEADLESS ?? "1").trim() === "1";
   const SLOWMO = Number(process.env.SLOWMO ?? (HEADLESS ? 0 : 600));
   const browser = await chromium.launch({ headless: HEADLESS, slowMo: SLOWMO });
-  let outPath = null;
+  let outPath = null;   // arquivo que sobe (juntado, ou só o da passada 1)
+  const arquivos = [];  // CSVs baixados em cada passada (temporários)
 
   try {
     const context = await browser.newContext({
@@ -203,72 +214,143 @@ async function runOnce() {
     console.log("4) Logado:", page.url());
     await debugScreenshot(page, "motoristas047_pos_login.png");
 
-    console.log('5) Abrindo opção 047...');
-    const existentes = new Set(context.pages());
-    const p047Promise = waitForNewPageWithSelector(context, 'input[name="f13"]', 45000, existentes);
-    await typeOption(page, "047");
+    // 1ª passada: quem teve movimento no último ano (base de motoristas que rodam).
+    console.log("5) Passada 1/2 — último movimento de 1 ano...");
+    const p047 = await abrir047(context, page);
+    arquivos.push(
+      await baixar047(context, p047, "movimento", {
+        f5: umAnoAtrasBR(), f6: hojeBR(), // último movimento: período
+        f7: "", f8: "",                   // cadastramento: vazio
+      })
+    );
 
-    // Pode abrir em popup ou no mesmo contexto; cobre os dois casos.
-    let p047 = await p047Promise;
-    if (!p047) {
-      const scope = await scopeWithSelector(page, 'input[name="f13"]', 15000);
-      if (scope) p047 = page;
+    // 2ª passada: recém-cadastrados que ainda NÃO têm movimento (ex.: Luzimar, 03/11/26)
+    // — o filtro de último movimento deixa esses de fora.
+    console.log(`6) Passada 2/2 — cadastrados nos últimos ${DIAS_CADASTRO} dias...`);
+    // Não-fatal: se ninguém foi cadastrado no período o SSW pode nem gerar arquivo.
+    try {
+      const p047b = await reabrir047(context, page, p047);
+      arquivos.push(
+        await baixar047(context, p047b, "cadastro", {
+          f5: "", f6: "",                                     // último movimento: vazio
+          f7: diasAtrasBR(DIAS_CADASTRO), f8: hojeBR(),       // cadastramento: período
+        }, 60000)
+      );
+    } catch (e2) {
+      console.error("⚠️ Passada 2 falhou; seguindo só com a passada 1:", e2?.message || String(e2));
+      await debugScreenshot(page, "motoristas047_passada2_erro.png");
     }
-    if (!p047) throw new Error("A opção 047 não abriu (não achei input[name='f13']).");
-    console.log("6) 047 aberta:", p047.url());
-    await debugScreenshot(p047, "motoristas047_aberta.png");
-
-    console.log("7) Preenchendo filtros...");
-    await fill(p047, 'input[name="f1"]', "T"); // Relação com a transportadora = todos
-    await fill(p047, 'input[name="f2"]', "T"); // Bloqueado = todos
-    await fill(p047, 'input[name="f5"]', umAnoAtrasBR()); // último movimento: início
-    await fill(p047, 'input[name="f6"]', hojeBR());       // último movimento: fim
-    await fill(p047, 'input[name="f13"]', "S"); // Arquivo em Excel = S (dispara o download)
-    await debugScreenshot(p047, "motoristas047_filtros.png");
-
-    console.log("8) Clicando ► e capturando o download...");
-    const geraSel = 'a[onclick*="ajaxEnvia(\'IMP\'"], a[id="14"]';
-    const geraScope = await scopeWithSelector(p047, geraSel, 30000);
-    if (!geraScope) throw new Error("Não achei o botão ► (gerar) do 047.");
-    const gera = geraScope.locator(geraSel).first();
-    await gera.waitFor({ state: "visible", timeout: 30000 });
-
-    const download = await capturarDownload(context, p047, 180000, async () => {
-      await gera.click();
-    });
-
-    let suggested = (download.suggestedFilename() || "").trim();
-    if (!suggested || !/\.(sswweb|csv|xls|xlsx|txt)$/i.test(suggested)) {
-      const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-      suggested = `CSVmotoristasDAG_${stamp}.sswweb`;
-    }
-
-    const outDir = path.join(process.cwd(), "downloads");
-    fs.mkdirSync(outDir, { recursive: true });
-    outPath = path.join(outDir, suggested);
-    await download.saveAs(outPath);
-    console.log("9) Baixado (temporário):", outPath);
-
-    validarArquivoExcel(outPath);
 
     await browser.close().catch(() => {});
 
-    console.log("10) Enviando para a API Dago...");
+    if (arquivos.length === 2) {
+      console.log("7) Juntando os dois arquivos...");
+      outPath = path.join(path.dirname(arquivos[0]), `CSVmotoristasDAG_juntado_${Date.now()}.sswweb`);
+      const { daPrimeira, daSegunda } = juntarArquivos047(arquivos[0], arquivos[1], outPath);
+      console.log(`   📄 passada 1: ${daPrimeira} linhas | passada 2: ${daSegunda} linhas (CPF repetido é casado no import)`);
+    } else {
+      outPath = arquivos[0];
+    }
+
+    console.log("8) Enviando para a API Dago...");
     await subirMotoristasSsw(outPath);
-    console.log("11) Atualização de motoristas (047) concluída.");
+    console.log("9) Atualização de motoristas (047) concluída.");
   } catch (e) {
     console.error("❌ Falhou:", e);
     throw e;
   } finally {
     await browser.close().catch(() => {});
     // Regra dos robôs de atualização: baixa, usa e apaga (nunca guarda o arquivo).
-    if (outPath) {
-      try {
-        fs.rmSync(outPath, { force: true });
-        console.log("12) Arquivo temporário removido.");
-      } catch {}
+    for (const f of [...arquivos, outPath].filter(Boolean)) {
+      try { fs.rmSync(f, { force: true }); } catch {}
+    }
+    if (arquivos.length || outPath) console.log("10) Arquivos temporários removidos.");
+  }
+}
+
+// Abre a opção 047 pelo menu (popup ou mesmo contexto).
+async function abrir047(context, page) {
+  const existentes = new Set(context.pages());
+  const p047Promise = waitForNewPageWithSelector(context, 'input[name="f13"]', 45000, existentes);
+  await typeOption(page, "047");
+
+  let p047 = await p047Promise;
+  if (!p047) {
+    const scope = await scopeWithSelector(page, 'input[name="f13"]', 15000);
+    if (scope) p047 = page;
+  }
+  if (!p047) throw new Error("A opção 047 não abriu (não achei input[name='f13']).");
+  console.log("   047 aberta:", p047.url());
+  await debugScreenshot(p047, "motoristas047_aberta.png");
+  return p047;
+}
+
+// Para a 2ª passada: reaproveita o formulário se ele continua na tela depois do download;
+// senão volta ao menu e abre a 047 de novo.
+async function reabrir047(context, page, p047) {
+  if (!p047.isClosed()) {
+    const scope = await scopeWithSelector(p047, 'input[name="f13"]', 5000);
+    if (scope) {
+      console.log("   reaproveitando o formulário da 047 já aberto.");
+      return p047;
     }
   }
+  console.log("   formulário sumiu; voltando ao menu e abrindo a 047 de novo.");
+  if (p047 !== page && !p047.isClosed()) await p047.close().catch(() => {});
+  if (!(await scopeWithSelector(page, 'input[name="f3"]', 5000))) {
+    await page.goto(MENU_URL, { waitUntil: "domcontentloaded" });
+  }
+  return abrir047(context, page);
+}
+
+// Preenche os filtros, clica ► e salva o CSV (temporário). Devolve o caminho.
+async function baixar047(context, p047, rotulo, periodos, timeoutDownloadMs = 180000) {
+  await fill(p047, 'input[name="f1"]', "T"); // Relação com a transportadora = todos
+  await fill(p047, 'input[name="f2"]', "T"); // Bloqueado = todos
+  for (const [campo, valor] of Object.entries(periodos)) {
+    await fill(p047, `input[name="${campo}"]`, valor);
+  }
+  await fill(p047, 'input[name="f13"]', "S"); // Arquivo em Excel = S (dispara o download)
+  await debugScreenshot(p047, `motoristas047_filtros_${rotulo}.png`);
+
+  const geraSel = 'a[onclick*="ajaxEnvia(\'IMP\'"], a[id="14"]';
+  const geraScope = await scopeWithSelector(p047, geraSel, 30000);
+  if (!geraScope) throw new Error("Não achei o botão ► (gerar) do 047.");
+  const gera = geraScope.locator(geraSel).first();
+  await gera.waitFor({ state: "visible", timeout: 30000 });
+
+  const download = await capturarDownload(context, p047, timeoutDownloadMs, async () => {
+    await gera.click();
+  });
+
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const outDir = path.join(process.cwd(), "downloads");
+  fs.mkdirSync(outDir, { recursive: true });
+  const outPath = path.join(outDir, `CSVmotoristasDAG_${rotulo}_${stamp}.sswweb`);
+  await download.saveAs(outPath);
+  console.log(`   baixado (${rotulo}, temporário):`, outPath);
+
+  validarArquivoExcel(outPath);
+  return outPath;
+}
+
+// Junta os dois CSVs do 047 num só, no mesmo layout do SSW:
+//   "0;" = cabeçalho, "1;" = motorista, "9;" = rodapé.
+// Mantém o arquivo 1 inteiro e encaixa as linhas "1;" do arquivo 2 antes do rodapé.
+// Latin1 dos dois lados (ida e volta sem perder acento).
+function juntarArquivos047(arq1, arq2, destino) {
+  const linhas1 = fs.readFileSync(arq1, "latin1").split(/\r?\n/);
+  const linhas2 = fs.readFileSync(arq2, "latin1").split(/\r?\n/);
+
+  const dados2 = linhas2.filter((l) => l.startsWith("1;"));
+  const daPrimeira = linhas1.filter((l) => l.startsWith("1;")).length;
+
+  let iRodape = linhas1.findIndex((l) => l.startsWith("9;"));
+  if (iRodape < 0) iRodape = linhas1.length;
+  const saida = [...linhas1.slice(0, iRodape), ...dados2, ...linhas1.slice(iRodape)];
+
+  fs.writeFileSync(destino, saida.join("\r\n"), "latin1");
+  return { daPrimeira, daSegunda: dados2.length };
 }
 
 // RETRY: tenta até 3x, intervalo de 5 min.

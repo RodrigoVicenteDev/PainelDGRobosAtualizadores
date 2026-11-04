@@ -7,9 +7,13 @@ Robôs Playwright que **logam no SSW, baixam cadastros/relatórios e alimentam a
 
 Baixa o cadastro de motoristas e sobe na API Dago.
 
-- **SSW:** opção **047** "Relação de Motoristas". Filtros aplicados:
-  Relação = `T` (todos), Bloqueado = `T` (todos), Último movimento = **(hoje − 1 ano) a hoje**,
+- **SSW:** opção **047** "Relação de Motoristas". Relação = `T` (todos), Bloqueado = `T` (todos),
   **Arquivo em Excel = `S`** (com isso o SSW já baixa o CSV direto, sem passar pela fila 156).
+  Roda **duas passadas** e junta os arquivos antes de subir (CPF repetido é casado no import):
+  1. Último movimento = **(hoje − 1 ano) a hoje** — quem roda.
+  2. Período de cadastramento = **(hoje − `DIAS_CADASTRO`) a hoje**, último movimento vazio — recém-cadastrados
+     que ainda não viajaram (a passada 1 não pega; caso Luzimar, 04/11/26). Padrão `DIAS_CADASTRO=30`.
+     Se essa passada falhar, o robô segue só com a 1ª.
 - **API Dago:** `POST /api/motoristas-ssw/importar` (autentica como usuário via Bearer, igual ao robô de clientes 467).
 - **Upsert:** casa por **CPF** (só dígitos). Atualiza só os campos de identidade do SSW
   (nome, CNH, validade CNH, telefone, endereço, cidade/UF, CEP, nascimento). **Não** mexe no que o
