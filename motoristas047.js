@@ -84,8 +84,8 @@ function umAnoAtrasBR() {
 }
 
 // ================= HELPERS SSW (frames imprevisíveis) =================
-const LOGIN_URL = "https://sistema.ssw.inf.br/bin/ssw0422";
-const MENU_URL = "https://sistema.ssw.inf.br/bin/menu01";
+const LOGIN_URL = "https://tms.ssw.inf.br/bin/ssw0422";
+const MENU_URL = "https://tms.ssw.inf.br/bin/menu01";
 const DIAS_CADASTRO = Number(process.env.DIAS_CADASTRO || 30);
 
 async function scopeWithSelector(page, selector, timeoutMs = 30000) {

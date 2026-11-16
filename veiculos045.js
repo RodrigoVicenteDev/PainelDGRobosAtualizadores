@@ -78,7 +78,7 @@ function umAnoAtrasBR() {
 }
 
 // ================= HELPERS SSW (frames imprevisíveis) =================
-const LOGIN_URL = "https://sistema.ssw.inf.br/bin/ssw0422";
+const LOGIN_URL = "https://tms.ssw.inf.br/bin/ssw0422";
 
 async function scopeWithSelector(page, selector, timeoutMs = 30000) {
   const deadline = Date.now() + timeoutMs;
